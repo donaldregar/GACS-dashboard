@@ -166,6 +166,72 @@ class GenieACS {
     }
 
     /**
+     * Determine if a parameter path exists on the provided device snapshot.
+     */
+    private function parameterExists($deviceData, $path) {
+        if ($deviceData === null) {
+            return false;
+        }
+
+        $segments = explode('.', $path);
+        $current = $deviceData;
+
+        foreach ($segments as $segment) {
+            if (!is_array($current) || !array_key_exists($segment, $current)) {
+                return false;
+            }
+            $current = $current[$segment];
+        }
+
+        if (is_array($current)) {
+            if (array_key_exists('_value', $current) || array_key_exists('_object', $current)) {
+                return true;
+            }
+
+            foreach ($current as $key => $value) {
+                if (in_array($key, ['_timestamp', '_type'], true)) {
+                    continue;
+                }
+
+                if ($value !== null) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return $current !== null;
+    }
+
+    /**
+     * Filter parameter paths based on device snapshot availability.
+     */
+    private function filterAvailablePaths(array $paths, $deviceData = null, array $fallback = []) {
+        if ($deviceData === null) {
+            return array_values(array_unique(array_merge($paths, $fallback)));
+        }
+
+        $available = [];
+
+        foreach ($paths as $path) {
+            if ($this->parameterExists($deviceData, $path)) {
+                $available[] = $path;
+            }
+        }
+
+        if (empty($available)) {
+            foreach ($fallback as $path) {
+                if (!in_array($path, $available, true)) {
+                    $available[] = $path;
+                }
+            }
+        }
+
+        return $available;
+    }
+
+    /**
      * Set WiFi configuration (SSID, Password, and Security Mode)
      *
      * @param string $deviceId Device ID
@@ -173,57 +239,108 @@ class GenieACS {
      * @param string $password New WiFi Password (optional for Open network)
      * @param int $wlanIndex WLAN Configuration index (default: 1)
      * @param string $securityMode Security mode (WPA2PSK, WPAPSK, WPA2PSKWPAPSK, None)
+     * @param array|null $deviceData Optional device snapshot for path detection
      * @return array Response with success status
      */
-    public function setWiFiConfig($deviceId, $ssid, $password = '', $wlanIndex = 1, $securityMode = 'WPA2PSK') {
+    public function setWiFiConfig($deviceId, $ssid, $password = '', $wlanIndex = 1, $securityMode = 'WPA2PSK', $deviceData = null) {
         $parameters = [];
 
-        // Try multiple parameter paths for different ONU vendors
-        $ssidPaths = [
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}.SSID",
-            "Device.WiFi.SSID.{$wlanIndex}.SSID"
-        ];
+        $defaultTr098 = "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}";
+        $defaultTr181 = "Device.WiFi";
 
-        $securityPaths = [
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}.BeaconType",
+        $isTr181 = $deviceData !== null && isset($deviceData['Device']);
+        $isTr098 = $deviceData !== null && isset($deviceData['InternetGatewayDevice']);
+
+        $ssidFallback = ["{$defaultTr098}.SSID"];
+        if ($deviceData === null || $isTr181) {
+            $ssidFallback[] = "{$defaultTr181}.SSID.{$wlanIndex}.SSID";
+        }
+
+        $securityFallback = ["{$defaultTr098}.BeaconType"];
+        if ($deviceData === null || $isTr181) {
+            $securityFallback[] = "Device.WiFi.AccessPoint.{$wlanIndex}.Security.ModeEnabled";
+        }
+
+        $passwordFallback = [];
+        if ($deviceData === null || $isTr098) {
+            $passwordFallback[] = "{$defaultTr098}.KeyPassphrase";
+        }
+        if ($deviceData === null || $isTr181) {
+            $passwordFallback[] = "Device.WiFi.AccessPoint.{$wlanIndex}.Security.KeyPassphrase";
+        }
+
+        $ssidPaths = $this->filterAvailablePaths([
+            "{$defaultTr098}.SSID",
+            "{$defaultTr181}.SSID.{$wlanIndex}.SSID"
+        ], $deviceData, $ssidFallback);
+
+        $securityPaths = $this->filterAvailablePaths([
+            "{$defaultTr098}.BeaconType",
             "Device.WiFi.AccessPoint.{$wlanIndex}.Security.ModeEnabled"
-        ];
+        ], $deviceData, $securityFallback);
 
-        $passwordPaths = [
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}.KeyPassphrase",
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}.PreSharedKey.1.KeyPassphrase",
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}.PreSharedKey.1.PreSharedKey",
-            "Device.WiFi.AccessPoint.{$wlanIndex}.Security.KeyPassphrase"
-        ];
+        $passwordPaths = $this->filterAvailablePaths([
+            "{$defaultTr098}.KeyPassphrase",
+            "{$defaultTr098}.PreSharedKey.1.KeyPassphrase",
+            "{$defaultTr098}.PreSharedKey.1.PreSharedKey",
+            "Device.WiFi.AccessPoint.{$wlanIndex}.Security.KeyPassphrase",
+            "Device.WiFi.AccessPoint.{$wlanIndex}.Security.PreSharedKey"
+        ], $deviceData, $passwordFallback);
 
-        // For now, use the most common TR-098 paths
-        // 1. Set SSID
-        $parameters[] = [$ssidPaths[0], $ssid, 'xsd:string'];
+        $authPaths = $this->filterAvailablePaths([
+            "{$defaultTr098}.WPAAuthenticationMode"
+        ], $deviceData);
 
-        // 2. Set Security Mode (BeaconType)
-        // Map security mode to BeaconType values
+        $encryptionPaths = $this->filterAvailablePaths([
+            "{$defaultTr098}.WPAEncryptionModes"
+        ], $deviceData);
+
+        foreach ($ssidPaths as $path) {
+            $parameters[] = [$path, $ssid, 'xsd:string'];
+        }
+
         $beaconTypeMap = [
             'WPA2PSK' => '11i',
             'WPAPSK' => 'WPA',
             'WPA2PSKWPAPSK' => 'WPAand11i',
-            'None' => 'Basic'  // or 'None' depending on device
+            'None' => 'Basic'
         ];
 
-        $beaconType = isset($beaconTypeMap[$securityMode]) ? $beaconTypeMap[$securityMode] : '11i';
-        $parameters[] = [$securityPaths[0], $beaconType, 'xsd:string'];
+        $modeEnabledMap = [
+            'WPA2PSK' => 'WPA2-PSK',
+            'WPAPSK' => 'WPA-PSK',
+            'WPA2PSKWPAPSK' => 'WPA-WPA2-PSK',
+            'None' => 'None'
+        ];
 
-        // 3. Set Password (only if security mode is not Open)
+        foreach ($securityPaths as $path) {
+            if (strpos($path, 'BeaconType') !== false) {
+                $value = $beaconTypeMap[$securityMode] ?? '11i';
+                $parameters[] = [$path, $value, 'xsd:string'];
+            } elseif (strpos($path, 'ModeEnabled') !== false) {
+                $value = $modeEnabledMap[$securityMode] ?? 'WPA2-PSK';
+                $parameters[] = [$path, $value, 'xsd:string'];
+            }
+        }
+
         if ($securityMode !== 'None' && !empty($password)) {
-            $parameters[] = [$passwordPaths[0], $password, 'xsd:string'];
+            foreach ($passwordPaths as $path) {
+                $parameters[] = [$path, $password, 'xsd:string'];
+            }
 
-            // Also set authentication mode for WPA/WPA2
-            $authModePath = "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}.WPAAuthenticationMode";
-            $parameters[] = [$authModePath, 'PSKAuthentication', 'xsd:string'];
+            foreach ($authPaths as $path) {
+                $parameters[] = [$path, 'PSKAuthentication', 'xsd:string'];
+            }
 
-            // Set encryption method
-            $encryptionPath = "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{$wlanIndex}.WPAEncryptionModes";
-            $encryptionMode = ($securityMode === 'WPA2PSK' || $securityMode === 'WPA2PSKWPAPSK') ? 'AESEncryption' : 'TKIPEncryption';
-            $parameters[] = [$encryptionPath, $encryptionMode, 'xsd:string'];
+            foreach ($encryptionPaths as $path) {
+                $encryptionMode = ($securityMode === 'WPA2PSK' || $securityMode === 'WPA2PSKWPAPSK') ? 'AESEncryption' : 'TKIPEncryption';
+                $parameters[] = [$path, $encryptionMode, 'xsd:string'];
+            }
+        } elseif ($securityMode === 'None') {
+            // Explicitly clear passwords when switching to open network
+            foreach ($passwordPaths as $path) {
+                $parameters[] = [$path, '', 'xsd:string'];
+            }
         }
 
         return $this->setParameterValues($deviceId, $parameters);
